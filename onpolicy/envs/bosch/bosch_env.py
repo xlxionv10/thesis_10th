@@ -93,7 +93,7 @@ class BoschEnv(object):
 
         # Reward shaping options for machine agents
         self.dense_production_reward = float(
-            getattr(args, "dense_production_reward", 1.0)
+            getattr(args, "dense_production_reward", 2.0)
         )
         self.dense_setup_penalty = float(getattr(args, "dense_setup_penalty", 1.0))
         self.dense_pm_penalty = float(getattr(args, "dense_pm_penalty", 1.0))
@@ -567,26 +567,34 @@ class BoschEnv(object):
         # ------------------------------------------------------------------
         lines_by_product = {p: [] for p in range(self.num_products)}
         demand_by_line = np.zeros(self.num_lines, dtype=np.float32)
-        total_demand_by_product = np.zeros(self.num_products, dtype=np.float32)
+        # 1. Identify which lines are assigned to which products and find max horizons
+        max_h_per_prod = np.zeros(self.num_products, dtype=np.int32)
+        demand_by_line = np.zeros(self.num_lines, dtype=np.float32)
+        lines_by_product = {p: [] for p in range(self.num_products)}
         
         for line_idx in range(self.num_lines):
             prod_idx = int(products[line_idx])
             horizon = int(horizons[line_idx])
-            if horizon <= 0:
-                continue
-            if self.line_eligibility[line_idx, prod_idx] < 0.5:
-                continue
-                
-            start = self.period_index
-            end = min(self.period_index + horizon, self.num_periods)
-            demand_sum = float(np.sum(self.demand[start:end, prod_idx]))
             
-            if demand_sum <= 0.0 and self.backlog[prod_idx] <= 0.0:
+            if horizon <= 0 or self.line_eligibility[line_idx, prod_idx] < 0.5:
                 continue
                 
             lines_by_product[prod_idx].append(line_idx)
-            demand_by_line[line_idx] = demand_sum
-            total_demand_by_product[prod_idx] += demand_sum
+            max_h_per_prod[prod_idx] = max(max_h_per_prod[prod_idx], horizon)
+            
+            # Per-line weight for waterfall distribution (still based on their chosen horizon)
+            t_start = self.period_index
+            t_end = min(self.period_index + horizon, self.num_periods)
+            demand_by_line[line_idx] = float(np.sum(self.demand[t_start:t_end, prod_idx]))
+
+        # 2. Compute True Global Demand Need (no double-counting)
+        total_demand_by_product = np.zeros(self.num_products, dtype=np.float32)
+        for p in range(self.num_products):
+            h = int(max_h_per_prod[p])
+            if h > 0:
+                t_start = self.period_index
+                t_end = min(self.period_index + h, self.num_periods)
+                total_demand_by_product[p] = float(np.sum(self.demand[t_start:t_end, p]))
 
         primary_hours_used = np.zeros(self.num_lines, dtype=np.float32)
 
@@ -624,13 +632,20 @@ class BoschEnv(object):
                     setup_time_for_line = float(self.first_setup_time[line_idx])
                 elif last_prod != prod_idx:
                     setup_time_for_line = float(self.setup_time_matrix[line_idx, last_prod, prod_idx])
+                
+                # Calculate total hours of work currently in the machine's physical queue (all products)
+                hours_in_queue = 0.0
+                for p in range(self.num_products):
+                    q = float(self.queue[line_idx, p])
+                    if q > 0:
+                        hours_in_queue += q * float(self.processing_time_matrix[line_idx, p])
                     
                 cap_hours = float(self.capacity_per_line[line_idx]) * float(horizon)
-                cap_hours = max(0.0, cap_hours - setup_time_for_line)
-                cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
+                # Deduct setup time AND existing queue hours
+                cap_hours = max(0.0, cap_hours - setup_time_for_line - hours_in_queue)
                 
-                current_queue = float(self.queue[line_idx, prod_idx])
-                available_cap = max(0.0, cap_units - current_queue)
+                # Convert the true remaining hours into units of the primary product
+                available_cap = cap_hours / proc_time if proc_time > 0.0 else 0.0
                 
                 line_available_caps[line_idx] = available_cap
                 line_proc_times[line_idx] = proc_time
@@ -696,9 +711,9 @@ class BoschEnv(object):
             primary_prod = int(products[line_idx])
             horizon = int(horizons[line_idx])
             
-            # Treat horizon=0 as a 1-day lookahead for the secondary product 
-            # so the secondary product can still function if primary was skipped.
-            effective_horizon = max(1, horizon)
+            # Secondary product is strictly a 1-day emergency filler 
+            # to prevent the machine from idling today.
+            sec_horizon = 1
 
             if horizon > 0 and self.line_eligibility[line_idx, primary_prod] >= 0.5:
                 effective_last_prod = primary_prod
@@ -715,13 +730,21 @@ class BoschEnv(object):
                     ]
                 )
 
-            # FIX 2: Multiply total capacity by the effective horizon!
-            total_cap_hours = float(self.capacity_per_line[line_idx]) * float(effective_horizon)
+            # Calculate total hours of work currently in the machine's physical queue
+            # (including leftovers from yesterday and what Primary Allocation just added)
+            hours_in_queue = 0.0
+            for p in range(self.num_products):
+                q = float(self.queue[line_idx, p])
+                if q > 0:
+                    hours_in_queue += q * float(self.processing_time_matrix[line_idx, p])
+
+            # Cap the physical queue space to 1 day's worth of capacity
+            total_cap_hours = float(self.capacity_per_line[line_idx]) * float(sec_horizon)
             
             remaining_hours = max(
                 0.0,
                 total_cap_hours
-                - float(primary_hours_used[line_idx])
+                - hours_in_queue
                 - sec_setup_time,
             )
             if remaining_hours <= 0.0:
@@ -729,13 +752,13 @@ class BoschEnv(object):
 
             remaining_units = remaining_hours / sec_proc_time
 
-            # NEW FIX: Prevent Secondary Queue Explosion by checking the existing bucket!
+            # Prevent Secondary Queue Explosion by checking the existing bucket!
             current_sec_queue = float(self.queue[line_idx, sec_prod])
             available_sec_cap = max(0.0, remaining_units - current_sec_queue)
 
-            # FIX 1: Bound the demand sum by the effective horizon!
+            # Bound the demand sum by the 1-day horizon
             start = self.period_index
-            end = min(self.period_index + effective_horizon, self.num_periods)
+            end = min(self.period_index + sec_horizon, self.num_periods)
             sec_demand_sum = float(np.sum(self.demand[start:end, sec_prod]))
 
             sec_need = (
@@ -944,8 +967,9 @@ class BoschEnv(object):
             mask[end_index] = 1.0
             return mask
 
-        # PM is always a valid control
-        mask[pm_index] = 1.0
+        # PM is only valid if the machine has some wear (age > 0)
+        if self.ages[line_idx] > 0.0:
+            mask[pm_index] = 1.0
         
         # Check if there are any products we can actually process
         can_work = False
@@ -1306,12 +1330,10 @@ class BoschEnv(object):
             if agent_id == 0:
                 queue_vec = self.queue.reshape(-1).astype(np.float32)
             else:
-                queue_vec = np.zeros(queue_segment_len, dtype=np.float32)
                 line_idx = agent_id - 1
-                if 0 <= line_idx < self.num_lines:
-                    start = line_idx * self.num_products
-                    end = start + self.num_products
-                    queue_vec[start:end] = self.queue[line_idx].astype(np.float32)
+                # Cyclic shift so this line's queue is at index 0
+                local_queue = np.roll(self.queue, -line_idx, axis=0)
+                queue_vec = local_queue.reshape(-1).astype(np.float32)
             vec[pos : pos + queue_segment_len] = queue_vec
             pos += queue_segment_len
 
@@ -1346,19 +1368,32 @@ class BoschEnv(object):
             vec[pos] = float(remaining_periods)
             pos += 1
 
-            # Line availability
-            vec[pos : pos + self.num_lines] = line_availability
+            # Line availability (cyclic shift for machines)
+            if agent_id == 0:
+                vec[pos : pos + self.num_lines] = line_availability
+            else:
+                line_idx = agent_id - 1
+                vec[pos : pos + self.num_lines] = np.roll(line_availability, -line_idx)
             pos += self.num_lines
 
-            # Line setup (flattened one-hot)
-            vec[pos : pos + self.num_lines * self.num_products] = line_setup_flat
+            # Line setup (cyclic shift for machines)
+            if agent_id == 0:
+                vec[pos : pos + self.num_lines * self.num_products] = line_setup_flat
+            else:
+                line_idx = agent_id - 1
+                local_setup_oh = np.roll(line_setup_oh, -line_idx, axis=0)
+                vec[pos : pos + self.num_lines * self.num_products] = local_setup_oh.reshape(-1)
             pos += self.num_lines * self.num_products
 
-            # Ages
-            vec[pos : pos + self.num_lines] = ages
+            # Ages (cyclic shift for machines)
+            if agent_id == 0:
+                vec[pos : pos + self.num_lines] = ages
+            else:
+                line_idx = agent_id - 1
+                vec[pos : pos + self.num_lines] = np.roll(ages, -line_idx)
             pos += self.num_lines
 
-            # Local line id one-hot (for machine agents only)
+            # Local line id one-hot (Absolute identity for machines)
             line_id_oh = np.zeros(self.num_lines, dtype=np.float32)
             if agent_id > 0:
                 line_idx = agent_id - 1

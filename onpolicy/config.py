@@ -167,13 +167,13 @@ def get_config():
                         action='store_false', default=True, help="by default, make sure random seed effective. if set, bypass such function.")
     parser.add_argument("--n_training_threads", type=int,
                         default=1, help="Number of torch threads for training")
-    parser.add_argument("--n_rollout_threads", type=int, default=32,
+    parser.add_argument("--n_rollout_threads", type=int, default=8,
                         help="Number of parallel envs for training rollouts")
     parser.add_argument("--n_eval_rollout_threads", type=int, default=1,
                         help="Number of parallel envs for evaluating rollouts")
     parser.add_argument("--n_render_rollout_threads", type=int, default=1,
                         help="Number of parallel envs for rendering rollouts")
-    parser.add_argument("--num_env_steps", type=int, default=10e6,
+    parser.add_argument("--num_env_steps", type=int, default=8000000,
                         help='Number of environment steps to train (default: 10e6)')
     parser.add_argument("--user_name", type=str, default='marl', help="[for wandb usage], to specify user's name for simply collecting training data.")
     parser.add_argument("--use_wandb", action='store_false', default=True, help="[for wandb usage], by default True, will log date to wandb server. or else will use tensorboard to log data.")
@@ -196,9 +196,9 @@ def get_config():
                         help="Dimension of hidden layers for actor/critic networks")
     parser.add_argument("--use_stacked_frames", action='store_true',
                         default=False, help="Whether to use stacked_frames")
-    parser.add_argument("--hidden_size", type=int, default=64,
+    parser.add_argument("--hidden_size", type=int, default=256,
                         help="Dimension of hidden layers for actor/critic networks") 
-    parser.add_argument("--layer_N", type=int, default=1,
+    parser.add_argument("--layer_N", type=int, default=2,
                         help="Number of layers for actor/critic networks")
     parser.add_argument("--use_ReLU", action='store_false',
                         default=True, help="Whether to use ReLU")
@@ -238,15 +238,15 @@ def get_config():
                         default=0.5, help='accept ratio of loss improve (default: 0.5)')
 
     # ppo parameters
-    parser.add_argument("--ppo_epoch", type=int, default=15,
+    parser.add_argument("--ppo_epoch", type=int, default=10,
                         help='number of ppo epochs (default: 15)')
     parser.add_argument("--use_clipped_value_loss",
                         action='store_false', default=True, help="by default, clip loss value. If set, do not clip loss value.")
     parser.add_argument("--clip_param", type=float, default=0.2,
                         help='ppo clip parameter (default: 0.2)')
-    parser.add_argument("--num_mini_batch", type=int, default=1,
+    parser.add_argument("--num_mini_batch", type=int, default=4,
                         help='number of batches for ppo (default: 1)')
-    parser.add_argument("--entropy_coef", type=float, default=0.01,
+    parser.add_argument("--entropy_coef", type=float, default=0.03,
                         help='entropy term coefficient (default: 0.01)')
     parser.add_argument("--value_loss_coef", type=float,
                         default=0.5, help='value loss coefficient (default: 0.5)')
@@ -276,7 +276,7 @@ def get_config():
     parser.add_argument("--save_interval", type=int, default=1, help="time duration between contiunous twice models saving.")
 
     # log parameters
-    parser.add_argument("--log_interval", type=int, default=5, help="time duration between contiunous twice log printing.")
+    parser.add_argument("--log_interval", type=int, default=50, help="time duration between contiunous twice log printing.")
 
     # eval parameters
     parser.add_argument("--use_eval", action='store_true', default=False, help="by default, do not start evaluation. If set`, start evaluation alongside with training.")
